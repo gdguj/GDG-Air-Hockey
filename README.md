@@ -1,7 +1,7 @@
 # GDG Air Hockey
 **Google Developer Group On Campus · University of Jeddah**
 
-A futuristic neon air hockey game with webcam hand-tracking, powered by MediaPipe and Pygame.
+Air hockey game with webcam hand-tracking, powered by MediaPipe and Pygame.
 
 ---
 
