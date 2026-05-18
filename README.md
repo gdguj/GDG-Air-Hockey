@@ -1,18 +1,17 @@
-# GDG Air Hockey
-**Google Developer Group On Campus · University of Jeddah**
+# GDG Pong - Motion Tracking Edition ⚡
 
-Air hockey game with webcam hand-tracking, powered by MediaPipe and Pygame.
+Welcome to **GDG Pong**, an interactive, motion-controlled arcade combat mini-game powered by **Next.js**, **Tailwind CSS**, and **Google MediaPipe AI** computer vision. 
+
+The application utilizes your computer's webcam to track your hand coordinates natively using optimized single-body dual tracking rules, making your hands the ultimate neon sabers!
 
 ---
 
-##  Quick Start
+## 🚨 QUICK START CHECKLIST (Run the game in 60 seconds)
 
-### 1. Install dependencies
-```bash
-pip install pygame opencv-python mediapipe numpy
-```
+If you just want to get the game running immediately, complete these **3 mandatory actions**:
 
-### 2. Run the game
-```bash
-python main.py
-```
+1. **Verify Your Folder Location:** Make sure your main folder is named exactly `GDG-pong` and contains `page.tsx`, `README.md`, and your logo image named `icon.png`.
+2. **Install the AI Framework:** Open your terminal and run `npm install @mediapipe/tasks-vision`.
+3. **Launch:** Run `npm run dev` and open **`http://localhost:3000/GDG-pong`** in your browser.
+
+---
