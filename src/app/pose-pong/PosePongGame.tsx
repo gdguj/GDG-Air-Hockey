@@ -7,19 +7,20 @@ import {
   NormalizedLandmark,
 } from "@mediapipe/tasks-vision";
 
-// Game Constants (HYPERSONIC WARPSPEED MAXIMUM LIMIT EDITION)
+// Game Constants (BALANCED HYPER-SPEED EDITION - ADJUSTED UP A LITTLE BIT)
 const WINNING_SCORE = 5;
-const BALL_INITIAL_SPEED = 50; // Supersonic launch velocity from the absolute first frame
-const SPEED_INCREMENT = 1.2;  // Insane warp speed build-up on regular hits
-const MAX_SPEED = 65;          // Massive cap raised to 65 for unbeatable tournament speed
-const SMASH_SPEED = 75;        // UNLEASH THE ABSOLUTE ULTRA-LASER BEAM AT 75!
+const BALL_INITIAL_SPEED = 34; 
+const SPEED_INCREMENT = 0.4;  
+const MAX_SPEED = 44;          
+const SMASH_SPEED = 52;        
 const HAND_RADIUS = 45;
 const BALL_RADIUS = 35;
 
-// Ultra-Responsive Tracking Smoothing Filter
-const SMOOTHING_FACTOR = 0.55; 
+// Advanced Predictive Jitter-Reduction Filter
+const SMOOTHING_FACTOR_LEFT = 0.55;
+const SMOOTHING_FACTOR_RIGHT = 0.65; 
 
-// UI Elements Offset Layout Padding
+// UI Layout Constraints
 const HEADER_HEIGHT = 54;
 const FOOTER_HEIGHT = 24;
 
@@ -206,10 +207,11 @@ export default function PosePongGame() {
               const n9 = landmarks[9];
               const n0 = landmarks[0];
               const n5 = landmarks[5];
-              if (!n9 || !n0 || !n5) return;
+              const n13 = landmarks[13];
+              if (!n9 || !n0 || !n5 || !n13) return;
 
-              const ptX = ((1 - n9.x) + (1 - n0.x) + (1 - n5.x)) / 3 * canvas.width;
-              const ptY = (n9.y + n0.y + n5.y) / 3 * canvas.height;
+              const ptX = ((1 - n9.x) + (1 - n0.x) + (1 - n5.x) + (1 - n13.x)) / 4 * canvas.width;
+              const ptY = (n9.y + n0.y + n5.y + n13.y) / 4 * canvas.height;
 
               if (ptX < canvas.width * 0.5) {
                 rawLeftTarget = { x: ptX, y: ptY };
@@ -223,8 +225,8 @@ export default function PosePongGame() {
           if (rawLeftTarget) {
             if (!prevLeftPaddle.current) prevLeftPaddle.current = rawLeftTarget;
             gameState.current.leftPaddle = {
-              x: prevLeftPaddle.current.x + SMOOTHING_FACTOR * (rawLeftTarget.x - prevLeftPaddle.current.x),
-              y: prevLeftPaddle.current.y + SMOOTHING_FACTOR * (rawLeftTarget.y - prevLeftPaddle.current.y),
+              x: prevLeftPaddle.current.x + SMOOTHING_FACTOR_LEFT * (rawLeftTarget.x - prevLeftPaddle.current.x),
+              y: prevLeftPaddle.current.y + SMOOTHING_FACTOR_LEFT * (rawLeftTarget.y - prevLeftPaddle.current.y),
             };
             prevLeftPaddle.current = gameState.current.leftPaddle;
           } else {
@@ -236,8 +238,8 @@ export default function PosePongGame() {
           if (rawRightTarget) {
             if (!prevRightPaddle.current) prevRightPaddle.current = rawRightTarget;
             gameState.current.rightPaddle = {
-              x: prevRightPaddle.current.x + SMOOTHING_FACTOR * (rawRightTarget.x - prevRightPaddle.current.x),
-              y: prevRightPaddle.current.y + SMOOTHING_FACTOR * (rawRightTarget.y - prevRightPaddle.current.y),
+              x: prevRightPaddle.current.x + SMOOTHING_FACTOR_RIGHT * (rawRightTarget.x - prevRightPaddle.current.x),
+              y: prevRightPaddle.current.y + SMOOTHING_FACTOR_RIGHT * (rawRightTarget.y - prevRightPaddle.current.y),
             };
             prevRightPaddle.current = gameState.current.rightPaddle;
           } else {
@@ -259,19 +261,25 @@ export default function PosePongGame() {
 
           if (ball.y - BALL_RADIUS <= HEADER_HEIGHT) {
             ball.y = HEADER_HEIGHT + BALL_RADIUS;
-            ball.vy *= -1;
+            ball.vy = Math.abs(ball.vy);
           } 
           else if (ball.y + BALL_RADIUS >= canvas.height - FOOTER_HEIGHT) {
             ball.y = canvas.height - FOOTER_HEIGHT - BALL_RADIUS;
-            ball.vy *= -1;
+            ball.vy = -Math.abs(ball.vy);
           }
 
           if (ball.x - BALL_RADIUS < 0) {
             if (ball.y >= goalTop && ball.y <= goalBottom) handleGoal("right");
-            else { ball.x = BALL_RADIUS; ball.vx *= -1; }
+            else { 
+              ball.x = BALL_RADIUS; 
+              ball.vx = Math.abs(ball.vx); 
+            }
           } else if (ball.x + BALL_RADIUS > canvas.width) {
             if (ball.y >= goalTop && ball.y <= goalBottom) handleGoal("left");
-            else { ball.x = canvas.width - BALL_RADIUS; ball.vx *= -1; }
+            else { 
+              ball.x = canvas.width - BALL_RADIUS; 
+              ball.vx = -Math.abs(ball.vx); 
+            }
           }
 
           const now = performance.now();
@@ -296,7 +304,7 @@ export default function PosePongGame() {
                   if (gs.consecutiveTouches >= 2) {
                     gs.isSmash = true;
                     gs.consecutiveTouches = 0;
-                    ball.speed = SMASH_SPEED; // Fires hyper velocity railgun trajectories
+                    ball.speed = SMASH_SPEED; 
                     setSmashFlash(true);
                     setTimeout(() => setSmashFlash(false), 1000);
                   } else {
@@ -425,7 +433,7 @@ export default function PosePongGame() {
         renderPaddleCircle(gameState.current.leftPaddle, true);
         renderPaddleCircle(gameState.current.rightPaddle, false);
 
-        // Core Orb Engine Physics
+        // Core Balanced Ball
         const ball = gameState.current.ball;
         const isSmash = gameState.current.isSmash;
         const isCharging = gameState.current.consecutiveTouches === 1;
@@ -668,7 +676,23 @@ export default function PosePongGame() {
                 background: "rgba(255,255,255,0.93)", borderRadius: 20,
                 padding: "24px 32px", border: "2px solid rgba(255,255,255,0.95)",
                 boxShadow: "0 10px 40px rgba(0,0,0,0.15)", backdropFilter: "blur(12px)",
+                display: "flex", flexDirection: "column"
               }}>
+                {/* CRITICAL UPDATE: LOGO MOVED TO THE ABSOLUTE TOP OF THE PANEL */}
+                <div style={{ display: "flex", justifyContent: "center", alignItems: "center", marginBottom: 12 }}>
+                  <img 
+                    src="/icon.png" 
+                    alt="GDG Club Logo" 
+                    style={{ 
+                      width: "68px", 
+                      height: "auto",
+                      objectFit: "contain",
+                      filter: "drop-shadow(0px 4px 10px rgba(0,0,0,0.08))"
+                    }} 
+                  />
+                </div>
+
+                {/* BRAND TITLE BELOW LOGO */}
                 <div style={{ textAlign: "center", marginBottom: 16 }}>
                   <div style={{ fontSize: 9, letterSpacing: "0.5em", color: GDG_GREEN, marginBottom: 6, fontWeight: 900 }}>
                     ⚡ GDG SPECIAL EDITION ONLINE ⚡
@@ -678,6 +702,7 @@ export default function PosePongGame() {
                   </h1>
                 </div>
 
+                {/* COMBAT MANUAL TEXT BOX */}
                 <div style={{
                   background: "rgba(0,0,0,0.04)", borderRadius: 12,
                   padding: "14px 18px", marginBottom: 16,
@@ -687,17 +712,22 @@ export default function PosePongGame() {
                     COMBAT MANUAL
                   </div>
                   <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 6 }}>
-                    <li style={{ display: "flex", gap: 10, color: "#373636" }}>
-                      <span style={{ color: GDG_GREEN, fontWeight: 900 }}>→</span> Center yourself completely in front of the lens.
+                    {/* CRITICAL FIX: FIRST LINE GREEN ARROW REMOVED */}
+                    <li style={{ color: "#373636" }}>
+                      Center yourself completely in front of the lens.
                     </li>
-                    <li style={{ display: "flex", gap: 10, color: "#373636" }}>
-                      <span style={{ color: GDG_GREEN, fontWeight: 900 }}>→</span> <span style={{ color: GDG_RED, fontWeight: 900 }}>Player A (Left Half)</span> — Moves any hand on the left field.
+                    {/* CRITICAL FIX: DASHES CLEANED REMOVED & LOCKED ON SINGLE LINES */}
+                    <li style={{ display: "flex", gap: 8, alignItems: "center", color: "#373636" }}>
+                      <span style={{ color: GDG_GREEN, fontWeight: 900 }}>→</span> 
+                      <span><span style={{ color: GDG_RED, fontWeight: 900 }}>Player A (Left Half)</span> Moves any hand on the left field.</span>
                     </li>
-                    <li style={{ display: "flex", gap: 10, color: "#373636" }}>
-                      <span style={{ color: GDG_BLUE, fontWeight: 900 }}>Player B (Right Half)</span> — Moves any hand on the right field.
+                    <li style={{ display: "flex", gap: 8, alignItems: "center", color: "#373636", whiteSpace: "nowrap" }}>
+                      <span style={{ color: GDG_GREEN, fontWeight: 900 }}>→</span> 
+                      <span><span style={{ color: GDG_BLUE, fontWeight: 900 }}>Player B (Right Half)</span> Moves any hand on the right field.</span>
                     </li>
-                    <li style={{ display: "flex", gap: 10, color: "#373636" }}>
-                      <span style={{ color: GDG_YELLOW, fontWeight: 900 }}>★</span> Warning: Absolute maximum velocity bounds activated.
+                    <li style={{ display: "flex", gap: 8, alignItems: "center", color: "#373636" }}>
+                      <span style={{ color: GDG_YELLOW, fontWeight: 900 }}>★</span> 
+                      <span>Warning: Absolute maximum velocity bounds activated.</span>
                     </li>
                   </ul>
                 </div>
