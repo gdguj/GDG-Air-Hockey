@@ -1,17 +1,44 @@
-# GDG Pong - Motion Tracking Edition ⚡
+# 🏓 GDG Air-Hockey
 
-Welcome to **GDG Pong**, an interactive, motion-controlled arcade combat mini-game powered by **Next.js**, **Tailwind CSS**, and **Google MediaPipe AI** computer vision. 
-
-The application utilizes your computer's webcam to track your hand coordinates natively using optimized single-body dual tracking rules, making your hands the ultimate neon sabers!
+An interactive motion-controlled arcade game built with **Next.js** and **Google MediaPipe AI**. Your hands are the paddles — no controller needed.
 
 ---
 
-## 🚨 QUICK START CHECKLIST (Run the game in 60 seconds)
+## 📋 Prerequisites
 
-If you just want to get the game running immediately, complete these **3 mandatory actions**:
-
-1. **Verify Your Folder Location:** Make sure your main folder is named exactly `GDG-pong` and contains `page.tsx`, `README.md`, and your logo image named `icon.png`.
-2. **Install the AI Framework:** Open your terminal and run `npm install @mediapipe/tasks-vision`.
-3. **Launch:** Run `npm run dev` and open **`http://localhost:3000/GDG-pong`** in your browser.
+- **Node.js 18+**
+- A **webcam**
+- **Google Chrome** (recommended)
 
 ---
+
+## 🛠️ Installation
+
+```bash
+git clone <PROJECT_REPOSITORY_URL>
+cd GDG-Air-Hockey
+npm install
+```
+
+---
+
+## 🚀 Run the Game
+
+```bash
+npm run dev
+```
+
+Then open your browser and go to:
+**http://localhost:3000**
+
+---
+
+## 🎮 How to Play
+
+- Allow camera access when prompted
+- Use your **LEFT HAND** to control **Player A (Red)**
+- Use your **RIGHT HAND** to control **Player B (Blue)**
+- Hit the ball into the opponent's goal to score
+- First to **5 points** wins!
+
+> 💡 Hit the ball **twice in a row** to trigger a **SMASH ⚡**
