@@ -48,6 +48,7 @@ import {
 } from "@/features/air-hockey/renderer/canvas";
 import { createHandLandmarker } from "@/features/air-hockey/services/mediapipe";
 import type { GamePoint, GameStateRef, PaddleTrackingRef, UIState } from "@/features/air-hockey/types";
+import logoImg from "@/app/icon.png";
 
 function GDGTitle({ text }: { text: string }) {
   const colors = [GDG_BLUE, GDG_RED, GDG_YELLOW, GDG_GREEN];
@@ -742,7 +743,7 @@ export default function AirHockeyGame() {
               >
                 <div style={{ display: "flex", justifyContent: "center", alignItems: "center", marginBottom: 12 }}>
                   <img
-                    src="/icon.png"
+                    src={logoImg.src}
                     alt="GDG Club Logo"
                     style={{ width: "68px", height: "auto", objectFit: "contain", filter: "drop-shadow(0px 4px 10px rgba(0,0,0,0.08))" }}
                   />
