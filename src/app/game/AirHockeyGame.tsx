@@ -1,69 +1,53 @@
 "use client";
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import {
+import type {
   HandLandmarker,
-  FilesetResolver,
   NormalizedLandmark,
 } from "@mediapipe/tasks-vision";
-
-// Game Constants 
-const WINNING_SCORE = 3;           // Changed from 5 to 3 goals to win
-const BALL_INITIAL_SPEED = 28;     // Reduced from 34 for a softer launch feel
-const SPEED_INCREMENT = 0.3;       // Reduced from 0.4 for a slower speed ramp
-const MAX_SPEED = 38;              // Reduced from 44 for a gentler cap
-const SMASH_SPEED = 46;            // Reduced from 52; smash is still powerful but not extreme
-const BALL_FRICTION = 0.994;       // NEW: friction factor applied each frame (1.0 = no friction)
-const HAND_RADIUS = 45;
-const BALL_RADIUS = 35;
-const TARGET_FRAME_MS = 1000 / 60;
-const DETECTION_INTERVAL_MS = 1000 / 45;
-const TRACKING_GRACE_MS = 120;
-
-// Hand Tracking / Smoothing 
-// Lower factor = more smoothing (more lag but less jitter)
-// Higher factor = faster response (less lag but more jitter)
-const SMOOTHING_FACTOR_LEFT = 0.45;   // Reduced from 0.55 for smoother left hand
-const SMOOTHING_FACTOR_RIGHT = 0.50;  // Reduced from 0.65 for smoother right hand
-const MIN_HAND_SMOOTHING = 0.28;
-const MAX_HAND_SMOOTHING = 0.62;
-const FAST_HAND_SPEED = 85;
-const HAND_PREDICTION_FACTOR = 0.20;
-
-const HEADER_HEIGHT = 54;
-const FOOTER_HEIGHT = 24;
-
-// GDG Brand Colors 
-const GDG_BLUE = "#4285F4";
-const GDG_RED = "#EA4335";
-const GDG_YELLOW = "#F9AB00";
-const GDG_GREEN = "#34A853";
-
-type UIState = "LOADING" | "START" | "COUNTDOWN" | "PLAYING" | "END" | "ERROR";
-
-interface GamePoint {
-  x: number;
-  y: number;
-}
-
-interface GameStateRef {
-  status: UIState;
-  ball: { x: number; y: number; vx: number; vy: number; speed: number };
-  scores: { left: number; right: number };
-  leftPaddle: GamePoint | null;
-  rightPaddle: GamePoint | null;
-  lastBounceTime: number;
-  lastTouchSide: "LEFT" | "RIGHT" | null;
-  consecutiveTouches: number;
-  isSmash: boolean;
-}
-
-interface PaddleTrackingRef {
-  smoothed: GamePoint | null;
-  previousRaw: GamePoint | null;
-  velocity: GamePoint;
-  lastSeenTime: number;
-}
+import {
+  BALL_INITIAL_SPEED,
+  BALL_RADIUS,
+  DETECTION_INTERVAL_MS,
+  FAST_HAND_SPEED,
+  FOOTER_HEIGHT,
+  GDG_BLUE,
+  GDG_GREEN,
+  GDG_RED,
+  GDG_YELLOW,
+  HAND_PREDICTION_FACTOR,
+  HAND_RADIUS,
+  HEADER_HEIGHT,
+  MAX_HAND_SMOOTHING,
+  MAX_SPEED,
+  MIN_HAND_SMOOTHING,
+  SMASH_SPEED,
+  SMOOTHING_FACTOR_LEFT,
+  SMOOTHING_FACTOR_RIGHT,
+  SPEED_INCREMENT,
+  TRACKING_GRACE_MS,
+  WINNING_SCORE,
+} from "@/features/air-hockey/constants";
+import {
+  clampPointToPlayArea as clampPointToPlayAreaHelper,
+  getPaddleCollisionNormal,
+  getSafePaddleVelocity,
+} from "@/features/air-hockey/engine/collision";
+import {
+  applyBallFrictionAndMovement,
+  bounceBallOffHorizontalWalls,
+  createCenteredBall,
+  createLaunchVelocity,
+  getFrameScale,
+} from "@/features/air-hockey/engine/physics";
+import {
+  drawBall,
+  drawCameraBackground,
+  drawPaddleCircle,
+  drawRink,
+} from "@/features/air-hockey/renderer/canvas";
+import { createHandLandmarker } from "@/features/air-hockey/services/mediapipe";
+import type { GamePoint, GameStateRef, PaddleTrackingRef, UIState } from "@/features/air-hockey/types";
 
 function GDGTitle({ text }: { text: string }) {
   const colors = [GDG_BLUE, GDG_RED, GDG_YELLOW, GDG_GREEN];
@@ -145,8 +129,7 @@ export default function AirHockeyGame() {
   }, []);
 
   const clampPointToPlayArea = useCallback((point: GamePoint, canvas: HTMLCanvasElement): GamePoint => ({
-    x: Math.min(canvas.width - HAND_RADIUS, Math.max(HAND_RADIUS, point.x)),
-    y: Math.min(canvas.height - FOOTER_HEIGHT - HAND_RADIUS, Math.max(HEADER_HEIGHT + HAND_RADIUS, point.y)),
+    ...clampPointToPlayAreaHelper(point, canvas.width, canvas.height),
   }), []);
 
   const updateTrackedPaddle = useCallback((
@@ -211,22 +194,13 @@ export default function AirHockeyGame() {
   const resetBall = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    gameState.current.ball = {
-      x: canvas.width / 2,
-      y: (canvas.height - HEADER_HEIGHT - FOOTER_HEIGHT) / 2 + HEADER_HEIGHT,
-      vx: 0,
-      vy: 0,
-      speed: BALL_INITIAL_SPEED,
-    };
+    gameState.current.ball = createCenteredBall(canvas.width, canvas.height);
   }, []);
 
   const launchBall = useCallback(() => {
-    const angle =
-      (Math.random() * Math.PI) / 2 -
-      Math.PI / 4 +
-      (Math.random() > 0.5 ? 0 : Math.PI);
-    gameState.current.ball.vx = Math.cos(angle) * BALL_INITIAL_SPEED;
-    gameState.current.ball.vy = Math.sin(angle) * BALL_INITIAL_SPEED;
+    const velocity = createLaunchVelocity();
+    gameState.current.ball.vx = velocity.vx;
+    gameState.current.ball.vy = velocity.vy;
   }, []);
 
   const startRound = useCallback(() => {
@@ -282,9 +256,7 @@ export default function AirHockeyGame() {
       const ctx = canvas?.getContext("2d");
       const video = videoRef.current;
       const now = performance.now();
-      const previousFrameTime = lastFrameTimeRef.current ?? now;
-      const deltaMs = Math.min(50, Math.max(0, now - previousFrameTime));
-      const frameScale = deltaMs / TARGET_FRAME_MS || 1;
+      const frameScale = getFrameScale(now, lastFrameTimeRef.current);
       lastFrameTimeRef.current = now;
 
       if (canvas && ctx && video && handLandmarkerRef.current && video.readyState >= 2) {
@@ -366,25 +338,10 @@ export default function AirHockeyGame() {
         if (gameState.current.status === "PLAYING") {
           const ball = gameState.current.ball;
 
-          // Apply friction each frame - puck gradually decelerates
-          const friction = Math.pow(BALL_FRICTION, frameScale);
-          ball.vx *= friction;
-          ball.vy *= friction;
-          // Also decay the stored speed so next bounce respects the deceleration
-          ball.speed *= friction;
-
-          // Move ball
-          ball.x += ball.vx * frameScale;
-          ball.y += ball.vy * frameScale;
+          applyBallFrictionAndMovement(ball, frameScale);
 
           // Top/bottom wall bounces
-          if (ball.y - BALL_RADIUS <= HEADER_HEIGHT) {
-            ball.y = HEADER_HEIGHT + BALL_RADIUS;
-            ball.vy = Math.abs(ball.vy);
-          } else if (ball.y + BALL_RADIUS >= canvas.height - FOOTER_HEIGHT) {
-            ball.y = canvas.height - FOOTER_HEIGHT - BALL_RADIUS;
-            ball.vy = -Math.abs(ball.vy);
-          }
+          bounceBallOffHorizontalWalls(ball, canvas.height);
 
           // Left/right wall - goal or wall bounce
           if (ball.x - BALL_RADIUS < 0) {
@@ -410,23 +367,8 @@ export default function AirHockeyGame() {
             let bounced = false;
             targets.forEach(({ point, side }) => {
               if (bounced || !point) return;
-              const dx = ball.x - point.x;
-              const dy = ball.y - point.y;
-              const distance = Math.sqrt(dx * dx + dy * dy);
+              const { distance, nx, ny } = getPaddleCollisionNormal(ball, point, side);
               if (distance < BALL_RADIUS + HAND_RADIUS) {
-                let nx = dx;
-                let ny = dy;
-                if (distance > 0.0001) {
-                  nx /= distance;
-                  ny /= distance;
-                } else {
-                  const fallbackX = side === "LEFT" ? 1 : -1;
-                  nx = Number.isFinite(ball.vx) && ball.vx !== 0 ? Math.sign(ball.vx) : fallbackX;
-                  ny = Number.isFinite(ball.vy) && ball.vy !== 0 ? Math.sign(ball.vy) : 0.25;
-                  const fallbackLength = Math.sqrt(nx * nx + ny * ny) || 1;
-                  nx /= fallbackLength;
-                  ny /= fallbackLength;
-                }
                 const gs = gameState.current;
 
                 if (gs.lastTouchSide === side) {
@@ -449,10 +391,9 @@ export default function AirHockeyGame() {
                 ball.vx = nx * ball.speed;
                 ball.vy = ny * ball.speed;
                 // Ensure ball never gets completely stuck in a straight horizontal line
-                if (!Number.isFinite(ball.vx)) ball.vx = side === "LEFT" ? ball.speed : -ball.speed;
-                if (!Number.isFinite(ball.vy)) ball.vy = ball.speed * 0.25;
-                if (Math.abs(ball.vx) < 2) ball.vx = ball.vx < 0 ? -2 : 2;
-                if (Math.abs(ball.vy) < 2) ball.vy = ball.vy < 0 ? -2 : 2;
+                const safeVelocity = getSafePaddleVelocity(ball, side);
+                ball.vx = safeVelocity.vx;
+                ball.vy = safeVelocity.vy;
                 gameState.current.lastBounceTime = now;
                 bounced = true;
               }
@@ -460,159 +401,15 @@ export default function AirHockeyGame() {
           }
         }
 
-        // RENDERING 
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawCameraBackground(ctx, canvas, video);
+        drawRink(ctx, canvas, goalTop, goalBottom);
+        drawPaddleCircle(ctx, gameState.current.leftPaddle, true);
+        drawPaddleCircle(ctx, gameState.current.rightPaddle, false);
 
-        // Draw mirrored webcam feed
-        ctx.save();
-        ctx.scale(-1, 1);
-        ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
-        ctx.restore();
-
-        // Subtle dark overlay for contrast
-        ctx.fillStyle = "rgba(0, 0, 15, 0.12)";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-        // Scanline effect
-        ctx.fillStyle = "rgba(255,255,255,0.006)";
-        for (let y = 0; y < canvas.height; y += 8) {
-          ctx.fillRect(0, y, canvas.width, 1);
-        }
-
-        // Goal walls (non-goal areas painted as walls)
-        const gateW = 20;
-        ctx.fillStyle = "rgba(234, 67, 53, 0.45)";
-        ctx.fillRect(0, HEADER_HEIGHT, gateW, goalTop - HEADER_HEIGHT);
-        ctx.fillRect(0, goalBottom, gateW, canvas.height - FOOTER_HEIGHT - goalBottom);
-
-        ctx.fillStyle = "rgba(66, 133, 244, 0.45)";
-        ctx.fillRect(canvas.width - gateW, HEADER_HEIGHT, gateW, goalTop - HEADER_HEIGHT);
-        ctx.fillRect(canvas.width - gateW, goalBottom, gateW, canvas.height - FOOTER_HEIGHT - goalBottom);
-
-        // Goal mouth outlines
-        ctx.shadowBlur = 18;
-        ctx.shadowColor = GDG_GREEN;
-        ctx.strokeStyle = GDG_GREEN;
-        ctx.lineWidth = 5;
-        ctx.beginPath();
-        ctx.moveTo(gateW, goalTop);
-        ctx.lineTo(0, goalTop);
-        ctx.lineTo(0, goalBottom);
-        ctx.lineTo(gateW, goalBottom);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(canvas.width - gateW, goalTop);
-        ctx.lineTo(canvas.width, goalTop);
-        ctx.lineTo(canvas.width, goalBottom);
-        ctx.lineTo(canvas.width - gateW, goalBottom);
-        ctx.stroke();
-        ctx.shadowBlur = 0;
-
-        // Center line gradient
-        const midGrad = ctx.createLinearGradient(canvas.width / 2 - 2, 0, canvas.width / 2 + 2, 0);
-        midGrad.addColorStop(0, "rgba(255,255,255,0)");
-        midGrad.addColorStop(0.5, "rgba(255,255,255,0.25)");
-        midGrad.addColorStop(1, "rgba(255,255,255,0)");
-        ctx.fillStyle = midGrad;
-        ctx.fillRect(canvas.width / 2 - 2, HEADER_HEIGHT, 4, canvas.height - HEADER_HEIGHT - FOOTER_HEIGHT);
-
-        ctx.save();
-        ctx.setLineDash([18, 12]);
-        ctx.strokeStyle = "rgba(255,255,255,0.2)";
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(canvas.width / 2, HEADER_HEIGHT);
-        ctx.lineTo(canvas.width / 2, canvas.height - FOOTER_HEIGHT);
-        ctx.stroke();
-        ctx.restore();
-
-        // Paddle rendering 
-        const renderPaddleCircle = (pt: GamePoint | null, isLeft: boolean) => {
-          if (!pt) return;
-          const neonColor = isLeft ? GDG_RED : GDG_BLUE;
-          const fillColor = isLeft ? "rgba(234,67,53,0.08)" : "rgba(66,133,244,0.08)";
-          const outerGlowColor = isLeft ? "rgba(234,67,53,0.07)" : "rgba(66,133,244,0.07)";
-          const label = isLeft ? "PLAYER A" : "PLAYER B";
-
-          ctx.beginPath();
-          ctx.arc(pt.x, pt.y, HAND_RADIUS + 8, 0, 2 * Math.PI);
-          ctx.fillStyle = outerGlowColor;
-          ctx.fill();
-
-          ctx.beginPath();
-          ctx.arc(pt.x, pt.y, HAND_RADIUS, 0, 2 * Math.PI);
-          ctx.fillStyle = fillColor;
-          ctx.fill();
-
-          ctx.shadowBlur = 22;
-          ctx.shadowColor = neonColor;
-          ctx.lineWidth = 3;
-          ctx.strokeStyle = neonColor;
-          ctx.stroke();
-          ctx.shadowBlur = 0;
-
-          ctx.strokeStyle = `${neonColor}99`;
-          ctx.lineWidth = 1.5;
-          ctx.beginPath();
-          ctx.moveTo(pt.x - HAND_RADIUS * 0.6, pt.y);
-          ctx.lineTo(pt.x + HAND_RADIUS * 0.6, pt.y);
-          ctx.moveTo(pt.x, pt.y - HAND_RADIUS * 0.6);
-          ctx.lineTo(pt.x, pt.y + HAND_RADIUS * 0.6);
-          ctx.stroke();
-
-          ctx.shadowBlur = 12;
-          ctx.shadowColor = neonColor;
-          ctx.fillStyle = neonColor;
-          ctx.font = "bold 13px 'Nunito', sans-serif";
-          ctx.textAlign = "center";
-          ctx.fillText(label, pt.x, pt.y + HAND_RADIUS + 18);
-          ctx.shadowBlur = 0;
-        };
-
-        renderPaddleCircle(gameState.current.leftPaddle, true);
-        renderPaddleCircle(gameState.current.rightPaddle, false);
-
-        // Ball rendering 
         const ball = gameState.current.ball;
         const isSmash = gameState.current.isSmash;
         const isCharging = gameState.current.consecutiveTouches === 1;
-
-        const coreColor = isSmash ? "#FF1010" : isCharging ? "#FF8000" : "#FFE000";
-        const glowColor = isSmash ? "#FF0000" : isCharging ? "#FF6000" : GDG_YELLOW;
-        const auraRadius = isSmash ? BALL_RADIUS * 4 : isCharging ? BALL_RADIUS * 3.5 : BALL_RADIUS * 3;
-        const auraAlpha = isSmash ? 0.75 : 0.6;
-        const auraAlpha2 = isSmash ? 0.35 : 0.2;
-
-        const ballGrad = ctx.createRadialGradient(ball.x, ball.y, 0, ball.x, ball.y, auraRadius);
-        ballGrad.addColorStop(0, `rgba(${isSmash ? "255,30,30" : isCharging ? "255,120,0" : "255,235,50"},${auraAlpha})`);
-        ballGrad.addColorStop(0.4, `rgba(${isSmash ? "255,0,0" : isCharging ? "255,80,0" : "255,120,0"},${auraAlpha2})`);
-        ballGrad.addColorStop(1, "rgba(255,0,0,0)");
-        ctx.beginPath();
-        ctx.arc(ball.x, ball.y, auraRadius, 0, 2 * Math.PI);
-        ctx.fillStyle = ballGrad;
-        ctx.fill();
-
-        ctx.beginPath();
-        ctx.arc(ball.x, ball.y, BALL_RADIUS, 0, 2 * Math.PI);
-        ctx.shadowBlur = isSmash ? 40 : 25;
-        ctx.shadowColor = glowColor;
-        ctx.fillStyle = coreColor;
-        ctx.fill();
-
-        if (isSmash) {
-          ctx.beginPath();
-          ctx.arc(ball.x, ball.y, BALL_RADIUS + 8, 0, 2 * Math.PI);
-          ctx.strokeStyle = "rgba(255,50,50,0.6)";
-          ctx.lineWidth = 3;
-          ctx.stroke();
-        }
-
-        // Specular highlight on ball
-        ctx.beginPath();
-        ctx.arc(ball.x - BALL_RADIUS * 0.3, ball.y - BALL_RADIUS * 0.35, BALL_RADIUS * 0.35, 0, 2 * Math.PI);
-        ctx.fillStyle = "rgba(255,255,255,0.7)";
-        ctx.shadowBlur = 0;
-        ctx.fill();
+        drawBall(ctx, ball, isSmash, isCharging);
       }
 
       requestRef.current = requestAnimationFrame(loop);
@@ -628,25 +425,6 @@ export default function AirHockeyGame() {
       video.srcObject = null;
     }
   }, []);
-
-  const createHandLandmarker = useCallback(
-    async (delegate: "GPU" | "CPU") => {
-      const filesetResolver = await FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/wasm",
-      );
-
-      return HandLandmarker.createFromOptions(filesetResolver, {
-        baseOptions: {
-          modelAssetPath:
-            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-          delegate,
-        },
-        runningMode: "VIDEO",
-        numHands: 2,
-      });
-    },
-    [],
-  );
 
   const initializeGame = useCallback(async () => {
     try {
@@ -724,7 +502,7 @@ export default function AirHockeyGame() {
       setStatusText("Camera or hand tracking setup failed.");
       updateUiState("ERROR");
     }
-  }, [createHandLandmarker, handleResize, stopCameraStream, updateUiState]);
+  }, [handleResize, stopCameraStream, updateUiState]);
 
   // INITIALIZATION
   useEffect(() => {
