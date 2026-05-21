@@ -39,6 +39,6 @@ Then open your browser and go to:
 - Use your **LEFT HAND** to control **Player A (Red)**
 - Use your **RIGHT HAND** to control **Player B (Blue)**
 - Hit the ball into the opponent's goal to score
-- First to **5 points** wins!
+- First to **3 points** wins!
 
 > 💡 Hit the ball **twice in a row** to trigger a **SMASH ⚡**
