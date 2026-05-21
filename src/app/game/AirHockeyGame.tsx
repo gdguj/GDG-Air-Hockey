@@ -16,12 +16,19 @@ const SMASH_SPEED = 46;            // Reduced from 52; smash is still powerful b
 const BALL_FRICTION = 0.994;       // NEW: friction factor applied each frame (1.0 = no friction)
 const HAND_RADIUS = 45;
 const BALL_RADIUS = 35;
+const TARGET_FRAME_MS = 1000 / 60;
+const DETECTION_INTERVAL_MS = 1000 / 45;
+const TRACKING_GRACE_MS = 120;
 
 // Hand Tracking / Smoothing 
 // Lower factor = more smoothing (more lag but less jitter)
 // Higher factor = faster response (less lag but more jitter)
 const SMOOTHING_FACTOR_LEFT = 0.45;   // Reduced from 0.55 for smoother left hand
 const SMOOTHING_FACTOR_RIGHT = 0.50;  // Reduced from 0.65 for smoother right hand
+const MIN_HAND_SMOOTHING = 0.28;
+const MAX_HAND_SMOOTHING = 0.62;
+const FAST_HAND_SPEED = 85;
+const HAND_PREDICTION_FACTOR = 0.20;
 
 const HEADER_HEIGHT = 54;
 const FOOTER_HEIGHT = 24;
@@ -49,6 +56,13 @@ interface GameStateRef {
   lastTouchSide: "LEFT" | "RIGHT" | null;
   consecutiveTouches: number;
   isSmash: boolean;
+}
+
+interface PaddleTrackingRef {
+  smoothed: GamePoint | null;
+  previousRaw: GamePoint | null;
+  velocity: GamePoint;
+  lastSeenTime: number;
 }
 
 function GDGTitle({ text }: { text: string }) {
@@ -79,10 +93,21 @@ export default function AirHockeyGame() {
   const requestRef = useRef<number | null>(null);
   const handLandmarkerRef = useRef<HandLandmarker | null>(null);
   const lastVideoTimeRef = useRef(-1);
+  const lastDetectionTimeRef = useRef(0);
+  const lastFrameTimeRef = useRef<number | null>(null);
 
-  // Smoothed previous positions for jitter-reduction filter
-  const prevLeftPaddle = useRef<GamePoint | null>(null);
-  const prevRightPaddle = useRef<GamePoint | null>(null);
+  const leftTrackingRef = useRef<PaddleTrackingRef>({
+    smoothed: null,
+    previousRaw: null,
+    velocity: { x: 0, y: 0 },
+    lastSeenTime: 0,
+  });
+  const rightTrackingRef = useRef<PaddleTrackingRef>({
+    smoothed: null,
+    previousRaw: null,
+    velocity: { x: 0, y: 0 },
+    lastSeenTime: 0,
+  });
 
   const gameState = useRef<GameStateRef>({
     status: "LOADING",
@@ -118,6 +143,70 @@ export default function AirHockeyGame() {
       canvasRef.current.height = window.innerHeight;
     }
   }, []);
+
+  const clampPointToPlayArea = useCallback((point: GamePoint, canvas: HTMLCanvasElement): GamePoint => ({
+    x: Math.min(canvas.width - HAND_RADIUS, Math.max(HAND_RADIUS, point.x)),
+    y: Math.min(canvas.height - FOOTER_HEIGHT - HAND_RADIUS, Math.max(HEADER_HEIGHT + HAND_RADIUS, point.y)),
+  }), []);
+
+  const updateTrackedPaddle = useCallback((
+    tracker: React.MutableRefObject<PaddleTrackingRef>,
+    rawTarget: GamePoint | null,
+    canvas: HTMLCanvasElement,
+    now: number,
+    baseSmoothing: number,
+  ) => {
+    const state = tracker.current;
+
+    if (rawTarget) {
+      const clampedRaw = clampPointToPlayArea(rawTarget, canvas);
+      const velocity = state.previousRaw
+        ? {
+          x: clampedRaw.x - state.previousRaw.x,
+          y: clampedRaw.y - state.previousRaw.y,
+        }
+        : { x: 0, y: 0 };
+      const speed = Math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+      const adaptiveAmount = Math.min(1, speed / FAST_HAND_SPEED);
+      const smoothing = Math.min(
+        MAX_HAND_SMOOTHING,
+        Math.max(
+          MIN_HAND_SMOOTHING,
+          MIN_HAND_SMOOTHING + adaptiveAmount * (MAX_HAND_SMOOTHING - MIN_HAND_SMOOTHING),
+          baseSmoothing * 0.8,
+        ),
+      );
+      const predicted = clampPointToPlayArea({
+        x: clampedRaw.x + velocity.x * HAND_PREDICTION_FACTOR,
+        y: clampedRaw.y + velocity.y * HAND_PREDICTION_FACTOR,
+      }, canvas);
+
+      state.smoothed = state.smoothed
+        ? {
+          x: state.smoothed.x + smoothing * (predicted.x - state.smoothed.x),
+          y: state.smoothed.y + smoothing * (predicted.y - state.smoothed.y),
+        }
+        : predicted;
+      state.smoothed = clampPointToPlayArea(state.smoothed, canvas);
+      state.previousRaw = clampedRaw;
+      state.velocity = velocity;
+      state.lastSeenTime = now;
+      return state.smoothed;
+    }
+
+    if (state.smoothed && now - state.lastSeenTime <= TRACKING_GRACE_MS) {
+      state.smoothed = clampPointToPlayArea({
+        x: state.smoothed.x + state.velocity.x * 0.15,
+        y: state.smoothed.y + state.velocity.y * 0.15,
+      }, canvas);
+      return state.smoothed;
+    }
+
+    state.smoothed = null;
+    state.previousRaw = null;
+    state.velocity = { x: 0, y: 0 };
+    return null;
+  }, [clampPointToPlayArea]);
 
   const resetBall = useCallback(() => {
     const canvas = canvasRef.current;
@@ -192,15 +281,23 @@ export default function AirHockeyGame() {
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext("2d");
       const video = videoRef.current;
+      const now = performance.now();
+      const previousFrameTime = lastFrameTimeRef.current ?? now;
+      const deltaMs = Math.min(50, Math.max(0, now - previousFrameTime));
+      const frameScale = deltaMs / TARGET_FRAME_MS || 1;
+      lastFrameTimeRef.current = now;
 
       if (canvas && ctx && video && handLandmarkerRef.current && video.readyState >= 2) {
-        const startTimeMs = performance.now();
+        const shouldDetect =
+          now - lastDetectionTimeRef.current >= DETECTION_INTERVAL_MS &&
+          lastVideoTimeRef.current !== video.currentTime &&
+          !video.paused;
 
-        // Only run detection when video frame actually advances
-        if (lastVideoTimeRef.current !== video.currentTime && !video.paused) {
+        if (shouldDetect) {
+          lastDetectionTimeRef.current = now;
           lastVideoTimeRef.current = video.currentTime;
 
-          const results = handLandmarkerRef.current.detectForVideo(video, startTimeMs);
+          const results = handLandmarkerRef.current.detectForVideo(video, now);
 
           let rawLeftTarget: GamePoint | null = null;
           let rawRightTarget: GamePoint | null = null;
@@ -229,33 +326,37 @@ export default function AirHockeyGame() {
             });
           }
 
-          // Exponential Moving Average smoothing - Left Hand 
-          if (rawLeftTarget) {
-            if (!prevLeftPaddle.current) prevLeftPaddle.current = rawLeftTarget;
-            gameState.current.leftPaddle = {
-              x: prevLeftPaddle.current.x + SMOOTHING_FACTOR_LEFT * ((rawLeftTarget as GamePoint).x - prevLeftPaddle.current.x),
-              y: prevLeftPaddle.current.y + SMOOTHING_FACTOR_LEFT * ((rawLeftTarget as GamePoint).y - prevLeftPaddle.current.y),
-            };
-            prevLeftPaddle.current = gameState.current.leftPaddle;
-          } else {
-            gameState.current.leftPaddle = null;
-            prevLeftPaddle.current = null;
-          }
+          gameState.current.leftPaddle = updateTrackedPaddle(
+            leftTrackingRef,
+            rawLeftTarget,
+            canvas,
+            now,
+            SMOOTHING_FACTOR_LEFT,
+          );
+          gameState.current.rightPaddle = updateTrackedPaddle(
+            rightTrackingRef,
+            rawRightTarget,
+            canvas,
+            now,
+            SMOOTHING_FACTOR_RIGHT,
+          );
 
-          // Exponential Moving Average smoothing - Right Hand
-          if (rawRightTarget) {
-            if (!prevRightPaddle.current) prevRightPaddle.current = rawRightTarget;
-            gameState.current.rightPaddle = {
-              x: prevRightPaddle.current.x + SMOOTHING_FACTOR_RIGHT * ((rawRightTarget as GamePoint).x - prevRightPaddle.current.x),
-              y: prevRightPaddle.current.y + SMOOTHING_FACTOR_RIGHT * ((rawRightTarget as GamePoint).y - prevRightPaddle.current.y),
-            };
-            prevRightPaddle.current = gameState.current.rightPaddle;
-          } else {
-            gameState.current.rightPaddle = null;
-            prevRightPaddle.current = null;
-          }
-
-          if (playerCount !== totalHands) setPlayerCount(totalHands);
+          setPlayerCount((currentCount) => currentCount === totalHands ? currentCount : totalHands);
+        } else {
+          gameState.current.leftPaddle = updateTrackedPaddle(
+            leftTrackingRef,
+            null,
+            canvas,
+            now,
+            SMOOTHING_FACTOR_LEFT,
+          );
+          gameState.current.rightPaddle = updateTrackedPaddle(
+            rightTrackingRef,
+            null,
+            canvas,
+            now,
+            SMOOTHING_FACTOR_RIGHT,
+          );
         }
 
         const goalTop = canvas.height * 0.35;
@@ -266,14 +367,15 @@ export default function AirHockeyGame() {
           const ball = gameState.current.ball;
 
           // Apply friction each frame - puck gradually decelerates
-          ball.vx *= BALL_FRICTION;
-          ball.vy *= BALL_FRICTION;
+          const friction = Math.pow(BALL_FRICTION, frameScale);
+          ball.vx *= friction;
+          ball.vy *= friction;
           // Also decay the stored speed so next bounce respects the deceleration
-          ball.speed *= BALL_FRICTION;
+          ball.speed *= friction;
 
           // Move ball
-          ball.x += ball.vx;
-          ball.y += ball.vy;
+          ball.x += ball.vx * frameScale;
+          ball.y += ball.vy * frameScale;
 
           // Top/bottom wall bounces
           if (ball.y - BALL_RADIUS <= HEADER_HEIGHT) {
@@ -300,7 +402,6 @@ export default function AirHockeyGame() {
           }
 
           // Paddle collision
-          const now = performance.now();
           if (now - gameState.current.lastBounceTime > 150) {
             const targets = [
               { point: gameState.current.leftPaddle, side: "LEFT" as const },
@@ -373,8 +474,8 @@ export default function AirHockeyGame() {
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
         // Scanline effect
-        for (let y = 0; y < canvas.height; y += 4) {
-          ctx.fillStyle = "rgba(255,255,255,0.006)";
+        ctx.fillStyle = "rgba(255,255,255,0.006)";
+        for (let y = 0; y < canvas.height; y += 8) {
           ctx.fillRect(0, y, canvas.width, 1);
         }
 
@@ -516,7 +617,7 @@ export default function AirHockeyGame() {
 
       requestRef.current = requestAnimationFrame(loop);
     },
-    [playerCount, handleGoal],
+    [handleGoal, updateTrackedPaddle],
   );
 
   const stopCameraStream = useCallback(() => {
@@ -552,6 +653,21 @@ export default function AirHockeyGame() {
       updateUiState("LOADING");
       setErrorMessage("");
       setPlayerCount(0);
+      lastVideoTimeRef.current = -1;
+      lastDetectionTimeRef.current = 0;
+      lastFrameTimeRef.current = null;
+      leftTrackingRef.current = {
+        smoothed: null,
+        previousRaw: null,
+        velocity: { x: 0, y: 0 },
+        lastSeenTime: 0,
+      };
+      rightTrackingRef.current = {
+        smoothed: null,
+        previousRaw: null,
+        velocity: { x: 0, y: 0 },
+        lastSeenTime: 0,
+      };
       stopCameraStream();
       if (handLandmarkerRef.current) {
         handLandmarkerRef.current.close();
@@ -571,8 +687,8 @@ export default function AirHockeyGame() {
 
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+          width: { ideal: 960 },
+          height: { ideal: 540 },
           frameRate: { ideal: 60, min: 30 },
           facingMode: "user",
         },
