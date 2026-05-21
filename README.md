@@ -1,10 +1,10 @@
-# 🏓 GDG Air-Hockey
+# GDG Air-Hockey
 
-An interactive motion-controlled arcade game built with **Next.js** and **Google MediaPipe AI**. Your hands are the paddles — no controller needed.
+An interactive motion-controlled arcade game built with **Next.js** and **Google MediaPipe AI**. Your hands are the paddles - no controller needed.
 
 ---
 
-## 📋 Prerequisites
+## Prerequisites
 
 - **Node.js 18+**
 - A **webcam**
@@ -12,7 +12,7 @@ An interactive motion-controlled arcade game built with **Next.js** and **Google
 
 ---
 
-## 🛠️ Installation
+## Installation
 
 ```bash
 git clone <PROJECT_REPOSITORY_URL>
@@ -22,7 +22,7 @@ npm install
 
 ---
 
-## 🚀 Run the Game
+## Run the Game
 
 ```bash
 npm run dev
@@ -33,7 +33,7 @@ Then open your browser and go to:
 
 ---
 
-## 🎮 How to Play
+## How to Play
 
 - Allow camera access when prompted
 - Use your **LEFT HAND** to control **Player A (Red)**
@@ -41,4 +41,4 @@ Then open your browser and go to:
 - Hit the ball into the opponent's goal to score
 - First to **3 points** wins!
 
-> 💡 Hit the ball **twice in a row** to trigger a **SMASH ⚡**
+> Hit the ball **twice in a row** to trigger a **SMASH**.

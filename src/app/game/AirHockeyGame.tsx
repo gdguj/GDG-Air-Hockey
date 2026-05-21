@@ -1,55 +1,53 @@
 "use client";
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import {
+import type {
   HandLandmarker,
-  FilesetResolver,
   NormalizedLandmark,
 } from "@mediapipe/tasks-vision";
-
-// Game Constants 
-const WINNING_SCORE = 3;           // Changed from 5 → 3 goals to win
-const BALL_INITIAL_SPEED = 28;     // Reduced from 34 — softer launch feel
-const SPEED_INCREMENT = 0.3;       // Reduced from 0.4 — slower speed ramp
-const MAX_SPEED = 38;              // Reduced from 44 — cap is gentler
-const SMASH_SPEED = 46;            // Reduced from 52 — smash still powerful but not extreme
-const BALL_FRICTION = 0.994;       // NEW: friction factor applied each frame (1.0 = no friction)
-const HAND_RADIUS = 45;
-const BALL_RADIUS = 35;
-
-// Hand Tracking / Smoothing 
-// Lower factor = more smoothing (more lag but less jitter)
-// Higher factor = faster response (less lag but more jitter)
-const SMOOTHING_FACTOR_LEFT = 0.45;   // Reduced from 0.55 — smoother left hand
-const SMOOTHING_FACTOR_RIGHT = 0.50;  // Reduced from 0.65 — smoother right hand
-
-const HEADER_HEIGHT = 54;
-const FOOTER_HEIGHT = 24;
-
-// GDG Brand Colors 
-const GDG_BLUE = "#4285F4";
-const GDG_RED = "#EA4335";
-const GDG_YELLOW = "#F9AB00";
-const GDG_GREEN = "#34A853";
-
-type UIState = "LOADING" | "START" | "COUNTDOWN" | "PLAYING" | "END";
-
-interface GamePoint {
-  x: number;
-  y: number;
-}
-
-interface GameStateRef {
-  status: UIState;
-  ball: { x: number; y: number; vx: number; vy: number; speed: number };
-  scores: { left: number; right: number };
-  leftPaddle: GamePoint | null;
-  rightPaddle: GamePoint | null;
-  lastBounceTime: number;
-  lastTouchSide: "LEFT" | "RIGHT" | null;
-  consecutiveTouches: number;
-  isSmash: boolean;
-}
+import {
+  BALL_INITIAL_SPEED,
+  BALL_RADIUS,
+  DETECTION_INTERVAL_MS,
+  FAST_HAND_SPEED,
+  FOOTER_HEIGHT,
+  GDG_BLUE,
+  GDG_GREEN,
+  GDG_RED,
+  GDG_YELLOW,
+  HAND_PREDICTION_FACTOR,
+  HAND_RADIUS,
+  HEADER_HEIGHT,
+  MAX_HAND_SMOOTHING,
+  MAX_SPEED,
+  MIN_HAND_SMOOTHING,
+  SMASH_SPEED,
+  SMOOTHING_FACTOR_LEFT,
+  SMOOTHING_FACTOR_RIGHT,
+  SPEED_INCREMENT,
+  TRACKING_GRACE_MS,
+  WINNING_SCORE,
+} from "@/features/air-hockey/constants";
+import {
+  clampPointToPlayArea as clampPointToPlayAreaHelper,
+  getPaddleCollisionNormal,
+  getSafePaddleVelocity,
+} from "@/features/air-hockey/engine/collision";
+import {
+  applyBallFrictionAndMovement,
+  bounceBallOffHorizontalWalls,
+  createCenteredBall,
+  createLaunchVelocity,
+  getFrameScale,
+} from "@/features/air-hockey/engine/physics";
+import {
+  drawBall,
+  drawCameraBackground,
+  drawPaddleCircle,
+  drawRink,
+} from "@/features/air-hockey/renderer/canvas";
+import { createHandLandmarker } from "@/features/air-hockey/services/mediapipe";
+import type { GamePoint, GameStateRef, PaddleTrackingRef, UIState } from "@/features/air-hockey/types";
 
 function GDGTitle({ text }: { text: string }) {
   const colors = [GDG_BLUE, GDG_RED, GDG_YELLOW, GDG_GREEN];
@@ -70,6 +68,7 @@ export default function AirHockeyGame() {
   const [countdown, setCountdown] = useState<number | string>(3);
   const [winner, setWinner] = useState("");
   const [statusText, setStatusText] = useState("Loading AI Hand Engine...");
+  const [errorMessage, setErrorMessage] = useState("");
   const [playerCount, setPlayerCount] = useState(0);
   const [smashFlash, setSmashFlash] = useState(false);
 
@@ -78,10 +77,21 @@ export default function AirHockeyGame() {
   const requestRef = useRef<number | null>(null);
   const handLandmarkerRef = useRef<HandLandmarker | null>(null);
   const lastVideoTimeRef = useRef(-1);
+  const lastDetectionTimeRef = useRef(0);
+  const lastFrameTimeRef = useRef<number | null>(null);
 
-  // Smoothed previous positions for jitter-reduction filter
-  const prevLeftPaddle = useRef<GamePoint | null>(null);
-  const prevRightPaddle = useRef<GamePoint | null>(null);
+  const leftTrackingRef = useRef<PaddleTrackingRef>({
+    smoothed: null,
+    previousRaw: null,
+    velocity: { x: 0, y: 0 },
+    lastSeenTime: 0,
+  });
+  const rightTrackingRef = useRef<PaddleTrackingRef>({
+    smoothed: null,
+    previousRaw: null,
+    velocity: { x: 0, y: 0 },
+    lastSeenTime: 0,
+  });
 
   const gameState = useRef<GameStateRef>({
     status: "LOADING",
@@ -118,25 +128,79 @@ export default function AirHockeyGame() {
     }
   }, []);
 
+  const clampPointToPlayArea = useCallback((point: GamePoint, canvas: HTMLCanvasElement): GamePoint => ({
+    ...clampPointToPlayAreaHelper(point, canvas.width, canvas.height),
+  }), []);
+
+  const updateTrackedPaddle = useCallback((
+    tracker: React.MutableRefObject<PaddleTrackingRef>,
+    rawTarget: GamePoint | null,
+    canvas: HTMLCanvasElement,
+    now: number,
+    baseSmoothing: number,
+  ) => {
+    const state = tracker.current;
+
+    if (rawTarget) {
+      const clampedRaw = clampPointToPlayArea(rawTarget, canvas);
+      const velocity = state.previousRaw
+        ? {
+          x: clampedRaw.x - state.previousRaw.x,
+          y: clampedRaw.y - state.previousRaw.y,
+        }
+        : { x: 0, y: 0 };
+      const speed = Math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+      const adaptiveAmount = Math.min(1, speed / FAST_HAND_SPEED);
+      const smoothing = Math.min(
+        MAX_HAND_SMOOTHING,
+        Math.max(
+          MIN_HAND_SMOOTHING,
+          MIN_HAND_SMOOTHING + adaptiveAmount * (MAX_HAND_SMOOTHING - MIN_HAND_SMOOTHING),
+          baseSmoothing * 0.8,
+        ),
+      );
+      const predicted = clampPointToPlayArea({
+        x: clampedRaw.x + velocity.x * HAND_PREDICTION_FACTOR,
+        y: clampedRaw.y + velocity.y * HAND_PREDICTION_FACTOR,
+      }, canvas);
+
+      state.smoothed = state.smoothed
+        ? {
+          x: state.smoothed.x + smoothing * (predicted.x - state.smoothed.x),
+          y: state.smoothed.y + smoothing * (predicted.y - state.smoothed.y),
+        }
+        : predicted;
+      state.smoothed = clampPointToPlayArea(state.smoothed, canvas);
+      state.previousRaw = clampedRaw;
+      state.velocity = velocity;
+      state.lastSeenTime = now;
+      return state.smoothed;
+    }
+
+    if (state.smoothed && now - state.lastSeenTime <= TRACKING_GRACE_MS) {
+      state.smoothed = clampPointToPlayArea({
+        x: state.smoothed.x + state.velocity.x * 0.15,
+        y: state.smoothed.y + state.velocity.y * 0.15,
+      }, canvas);
+      return state.smoothed;
+    }
+
+    state.smoothed = null;
+    state.previousRaw = null;
+    state.velocity = { x: 0, y: 0 };
+    return null;
+  }, [clampPointToPlayArea]);
+
   const resetBall = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    gameState.current.ball = {
-      x: canvas.width / 2,
-      y: (canvas.height - HEADER_HEIGHT - FOOTER_HEIGHT) / 2 + HEADER_HEIGHT,
-      vx: 0,
-      vy: 0,
-      speed: BALL_INITIAL_SPEED,
-    };
+    gameState.current.ball = createCenteredBall(canvas.width, canvas.height);
   }, []);
 
   const launchBall = useCallback(() => {
-    const angle =
-      (Math.random() * Math.PI) / 2 -
-      Math.PI / 4 +
-      (Math.random() > 0.5 ? 0 : Math.PI);
-    gameState.current.ball.vx = Math.cos(angle) * BALL_INITIAL_SPEED;
-    gameState.current.ball.vy = Math.sin(angle) * BALL_INITIAL_SPEED;
+    const velocity = createLaunchVelocity();
+    gameState.current.ball.vx = velocity.vx;
+    gameState.current.ball.vy = velocity.vy;
   }, []);
 
   const startRound = useCallback(() => {
@@ -173,10 +237,10 @@ export default function AirHockeyGame() {
       gameState.current.consecutiveTouches = 0;
       updateScores(newScores.left, newScores.right);
       if (newScores.left >= WINNING_SCORE) {
-        setWinner("Red Player — Left Side");
+        setWinner("Red Player - Left Side");
         updateUiState("END");
       } else if (newScores.right >= WINNING_SCORE) {
-        setWinner("Blue Player — Right Side");
+        setWinner("Blue Player - Right Side");
         updateUiState("END");
       } else {
         startRound();
@@ -191,15 +255,21 @@ export default function AirHockeyGame() {
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext("2d");
       const video = videoRef.current;
+      const now = performance.now();
+      const frameScale = getFrameScale(now, lastFrameTimeRef.current);
+      lastFrameTimeRef.current = now;
 
       if (canvas && ctx && video && handLandmarkerRef.current && video.readyState >= 2) {
-        const startTimeMs = performance.now();
+        const shouldDetect =
+          now - lastDetectionTimeRef.current >= DETECTION_INTERVAL_MS &&
+          lastVideoTimeRef.current !== video.currentTime &&
+          !video.paused;
 
-        // Only run detection when video frame actually advances
-        if (lastVideoTimeRef.current !== video.currentTime && !video.paused) {
+        if (shouldDetect) {
+          lastDetectionTimeRef.current = now;
           lastVideoTimeRef.current = video.currentTime;
 
-          const results = handLandmarkerRef.current.detectForVideo(video, startTimeMs);
+          const results = handLandmarkerRef.current.detectForVideo(video, now);
 
           let rawLeftTarget: GamePoint | null = null;
           let rawRightTarget: GamePoint | null = null;
@@ -228,33 +298,37 @@ export default function AirHockeyGame() {
             });
           }
 
-          // Exponential Moving Average smoothing — Left Hand 
-          if (rawLeftTarget) {
-            if (!prevLeftPaddle.current) prevLeftPaddle.current = rawLeftTarget;
-            gameState.current.leftPaddle = {
-              x: prevLeftPaddle.current.x + SMOOTHING_FACTOR_LEFT * ((rawLeftTarget as GamePoint).x - prevLeftPaddle.current.x),
-              y: prevLeftPaddle.current.y + SMOOTHING_FACTOR_LEFT * ((rawLeftTarget as GamePoint).y - prevLeftPaddle.current.y),
-            };
-            prevLeftPaddle.current = gameState.current.leftPaddle;
-          } else {
-            gameState.current.leftPaddle = null;
-            prevLeftPaddle.current = null;
-          }
+          gameState.current.leftPaddle = updateTrackedPaddle(
+            leftTrackingRef,
+            rawLeftTarget,
+            canvas,
+            now,
+            SMOOTHING_FACTOR_LEFT,
+          );
+          gameState.current.rightPaddle = updateTrackedPaddle(
+            rightTrackingRef,
+            rawRightTarget,
+            canvas,
+            now,
+            SMOOTHING_FACTOR_RIGHT,
+          );
 
-          // ── Exponential Moving Average smoothing — Right Hand ──
-          if (rawRightTarget) {
-            if (!prevRightPaddle.current) prevRightPaddle.current = rawRightTarget;
-            gameState.current.rightPaddle = {
-              x: prevRightPaddle.current.x + SMOOTHING_FACTOR_RIGHT * ((rawRightTarget as GamePoint).x - prevRightPaddle.current.x),
-              y: prevRightPaddle.current.y + SMOOTHING_FACTOR_RIGHT * ((rawRightTarget as GamePoint).y - prevRightPaddle.current.y),
-            };
-            prevRightPaddle.current = gameState.current.rightPaddle;
-          } else {
-            gameState.current.rightPaddle = null;
-            prevRightPaddle.current = null;
-          }
-
-          if (playerCount !== totalHands) setPlayerCount(totalHands);
+          setPlayerCount((currentCount) => currentCount === totalHands ? currentCount : totalHands);
+        } else {
+          gameState.current.leftPaddle = updateTrackedPaddle(
+            leftTrackingRef,
+            null,
+            canvas,
+            now,
+            SMOOTHING_FACTOR_LEFT,
+          );
+          gameState.current.rightPaddle = updateTrackedPaddle(
+            rightTrackingRef,
+            null,
+            canvas,
+            now,
+            SMOOTHING_FACTOR_RIGHT,
+          );
         }
 
         const goalTop = canvas.height * 0.35;
@@ -264,26 +338,12 @@ export default function AirHockeyGame() {
         if (gameState.current.status === "PLAYING") {
           const ball = gameState.current.ball;
 
-          // Apply friction each frame — puck gradually decelerates
-          ball.vx *= BALL_FRICTION;
-          ball.vy *= BALL_FRICTION;
-          // Also decay the stored speed so next bounce respects the deceleration
-          ball.speed *= BALL_FRICTION;
-
-          // Move ball
-          ball.x += ball.vx;
-          ball.y += ball.vy;
+          applyBallFrictionAndMovement(ball, frameScale);
 
           // Top/bottom wall bounces
-          if (ball.y - BALL_RADIUS <= HEADER_HEIGHT) {
-            ball.y = HEADER_HEIGHT + BALL_RADIUS;
-            ball.vy = Math.abs(ball.vy);
-          } else if (ball.y + BALL_RADIUS >= canvas.height - FOOTER_HEIGHT) {
-            ball.y = canvas.height - FOOTER_HEIGHT - BALL_RADIUS;
-            ball.vy = -Math.abs(ball.vy);
-          }
+          bounceBallOffHorizontalWalls(ball, canvas.height);
 
-          // Left/right wall — goal or wall bounce
+          // Left/right wall - goal or wall bounce
           if (ball.x - BALL_RADIUS < 0) {
             if (ball.y >= goalTop && ball.y <= goalBottom) handleGoal("right");
             else {
@@ -298,8 +358,7 @@ export default function AirHockeyGame() {
             }
           }
 
-          // ── Paddle collision ──
-          const now = performance.now();
+          // Paddle collision
           if (now - gameState.current.lastBounceTime > 150) {
             const targets = [
               { point: gameState.current.leftPaddle, side: "LEFT" as const },
@@ -308,12 +367,8 @@ export default function AirHockeyGame() {
             let bounced = false;
             targets.forEach(({ point, side }) => {
               if (bounced || !point) return;
-              const dx = ball.x - point.x;
-              const dy = ball.y - point.y;
-              const distance = Math.sqrt(dx * dx + dy * dy);
+              const { distance, nx, ny } = getPaddleCollisionNormal(ball, point, side);
               if (distance < BALL_RADIUS + HAND_RADIUS) {
-                const nx = dx / distance;
-                const ny = dy / distance;
                 const gs = gameState.current;
 
                 if (gs.lastTouchSide === side) {
@@ -336,8 +391,9 @@ export default function AirHockeyGame() {
                 ball.vx = nx * ball.speed;
                 ball.vy = ny * ball.speed;
                 // Ensure ball never gets completely stuck in a straight horizontal line
-                if (Math.abs(ball.vx) < 2) ball.vx = Math.sign(ball.vx) * 2;
-                if (Math.abs(ball.vy) < 2) ball.vy = Math.sign(ball.vy) * 2;
+                const safeVelocity = getSafePaddleVelocity(ball, side);
+                ball.vx = safeVelocity.vx;
+                ball.vy = safeVelocity.vy;
                 gameState.current.lastBounceTime = now;
                 bounced = true;
               }
@@ -345,230 +401,120 @@ export default function AirHockeyGame() {
           }
         }
 
-        // RENDERING 
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawCameraBackground(ctx, canvas, video);
+        drawRink(ctx, canvas, goalTop, goalBottom);
+        drawPaddleCircle(ctx, gameState.current.leftPaddle, true);
+        drawPaddleCircle(ctx, gameState.current.rightPaddle, false);
 
-        // Draw mirrored webcam feed
-        ctx.save();
-        ctx.scale(-1, 1);
-        ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
-        ctx.restore();
-
-        // Subtle dark overlay for contrast
-        ctx.fillStyle = "rgba(0, 0, 15, 0.12)";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-        // Scanline effect
-        for (let y = 0; y < canvas.height; y += 4) {
-          ctx.fillStyle = "rgba(255,255,255,0.006)";
-          ctx.fillRect(0, y, canvas.width, 1);
-        }
-
-        // Goal walls (non-goal areas painted as walls)
-        const gateW = 20;
-        ctx.fillStyle = "rgba(234, 67, 53, 0.45)";
-        ctx.fillRect(0, HEADER_HEIGHT, gateW, goalTop - HEADER_HEIGHT);
-        ctx.fillRect(0, goalBottom, gateW, canvas.height - FOOTER_HEIGHT - goalBottom);
-
-        ctx.fillStyle = "rgba(66, 133, 244, 0.45)";
-        ctx.fillRect(canvas.width - gateW, HEADER_HEIGHT, gateW, goalTop - HEADER_HEIGHT);
-        ctx.fillRect(canvas.width - gateW, goalBottom, gateW, canvas.height - FOOTER_HEIGHT - goalBottom);
-
-        // Goal mouth outlines
-        ctx.shadowBlur = 18;
-        ctx.shadowColor = GDG_GREEN;
-        ctx.strokeStyle = GDG_GREEN;
-        ctx.lineWidth = 5;
-        ctx.beginPath();
-        ctx.moveTo(gateW, goalTop);
-        ctx.lineTo(0, goalTop);
-        ctx.lineTo(0, goalBottom);
-        ctx.lineTo(gateW, goalBottom);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(canvas.width - gateW, goalTop);
-        ctx.lineTo(canvas.width, goalTop);
-        ctx.lineTo(canvas.width, goalBottom);
-        ctx.lineTo(canvas.width - gateW, goalBottom);
-        ctx.stroke();
-        ctx.shadowBlur = 0;
-
-        // Center line gradient
-        const midGrad = ctx.createLinearGradient(canvas.width / 2 - 2, 0, canvas.width / 2 + 2, 0);
-        midGrad.addColorStop(0, "rgba(255,255,255,0)");
-        midGrad.addColorStop(0.5, "rgba(255,255,255,0.25)");
-        midGrad.addColorStop(1, "rgba(255,255,255,0)");
-        ctx.fillStyle = midGrad;
-        ctx.fillRect(canvas.width / 2 - 2, HEADER_HEIGHT, 4, canvas.height - HEADER_HEIGHT - FOOTER_HEIGHT);
-
-        ctx.save();
-        ctx.setLineDash([18, 12]);
-        ctx.strokeStyle = "rgba(255,255,255,0.2)";
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(canvas.width / 2, HEADER_HEIGHT);
-        ctx.lineTo(canvas.width / 2, canvas.height - FOOTER_HEIGHT);
-        ctx.stroke();
-        ctx.restore();
-
-        // Paddle rendering 
-        const renderPaddleCircle = (pt: GamePoint | null, isLeft: boolean) => {
-          if (!pt) return;
-          const neonColor = isLeft ? GDG_RED : GDG_BLUE;
-          const fillColor = isLeft ? "rgba(234,67,53,0.08)" : "rgba(66,133,244,0.08)";
-          const outerGlowColor = isLeft ? "rgba(234,67,53,0.07)" : "rgba(66,133,244,0.07)";
-          const label = isLeft ? "PLAYER A" : "PLAYER B";
-
-          ctx.beginPath();
-          ctx.arc(pt.x, pt.y, HAND_RADIUS + 8, 0, 2 * Math.PI);
-          ctx.fillStyle = outerGlowColor;
-          ctx.fill();
-
-          ctx.beginPath();
-          ctx.arc(pt.x, pt.y, HAND_RADIUS, 0, 2 * Math.PI);
-          ctx.fillStyle = fillColor;
-          ctx.fill();
-
-          ctx.shadowBlur = 22;
-          ctx.shadowColor = neonColor;
-          ctx.lineWidth = 3;
-          ctx.strokeStyle = neonColor;
-          ctx.stroke();
-          ctx.shadowBlur = 0;
-
-          ctx.strokeStyle = `${neonColor}99`;
-          ctx.lineWidth = 1.5;
-          ctx.beginPath();
-          ctx.moveTo(pt.x - HAND_RADIUS * 0.6, pt.y);
-          ctx.lineTo(pt.x + HAND_RADIUS * 0.6, pt.y);
-          ctx.moveTo(pt.x, pt.y - HAND_RADIUS * 0.6);
-          ctx.lineTo(pt.x, pt.y + HAND_RADIUS * 0.6);
-          ctx.stroke();
-
-          ctx.shadowBlur = 12;
-          ctx.shadowColor = neonColor;
-          ctx.fillStyle = neonColor;
-          ctx.font = "bold 13px 'Nunito', sans-serif";
-          ctx.textAlign = "center";
-          ctx.fillText(label, pt.x, pt.y + HAND_RADIUS + 18);
-          ctx.shadowBlur = 0;
-        };
-
-        renderPaddleCircle(gameState.current.leftPaddle, true);
-        renderPaddleCircle(gameState.current.rightPaddle, false);
-
-        // Ball rendering 
         const ball = gameState.current.ball;
         const isSmash = gameState.current.isSmash;
         const isCharging = gameState.current.consecutiveTouches === 1;
-
-        const coreColor = isSmash ? "#FF1010" : isCharging ? "#FF8000" : "#FFE000";
-        const glowColor = isSmash ? "#FF0000" : isCharging ? "#FF6000" : GDG_YELLOW;
-        const auraRadius = isSmash ? BALL_RADIUS * 4 : isCharging ? BALL_RADIUS * 3.5 : BALL_RADIUS * 3;
-        const auraAlpha = isSmash ? 0.75 : 0.6;
-        const auraAlpha2 = isSmash ? 0.35 : 0.2;
-
-        const ballGrad = ctx.createRadialGradient(ball.x, ball.y, 0, ball.x, ball.y, auraRadius);
-        ballGrad.addColorStop(0, `rgba(${isSmash ? "255,30,30" : isCharging ? "255,120,0" : "255,235,50"},${auraAlpha})`);
-        ballGrad.addColorStop(0.4, `rgba(${isSmash ? "255,0,0" : isCharging ? "255,80,0" : "255,120,0"},${auraAlpha2})`);
-        ballGrad.addColorStop(1, "rgba(255,0,0,0)");
-        ctx.beginPath();
-        ctx.arc(ball.x, ball.y, auraRadius, 0, 2 * Math.PI);
-        ctx.fillStyle = ballGrad;
-        ctx.fill();
-
-        ctx.beginPath();
-        ctx.arc(ball.x, ball.y, BALL_RADIUS, 0, 2 * Math.PI);
-        ctx.shadowBlur = isSmash ? 40 : 25;
-        ctx.shadowColor = glowColor;
-        ctx.fillStyle = coreColor;
-        ctx.fill();
-
-        if (isSmash) {
-          ctx.beginPath();
-          ctx.arc(ball.x, ball.y, BALL_RADIUS + 8, 0, 2 * Math.PI);
-          ctx.strokeStyle = "rgba(255,50,50,0.6)";
-          ctx.lineWidth = 3;
-          ctx.stroke();
-        }
-
-        // Specular highlight on ball
-        ctx.beginPath();
-        ctx.arc(ball.x - BALL_RADIUS * 0.3, ball.y - BALL_RADIUS * 0.35, BALL_RADIUS * 0.35, 0, 2 * Math.PI);
-        ctx.fillStyle = "rgba(255,255,255,0.7)";
-        ctx.shadowBlur = 0;
-        ctx.fill();
+        drawBall(ctx, ball, isSmash, isCharging);
       }
 
       requestRef.current = requestAnimationFrame(loop);
     },
-    [playerCount, handleGoal],
+    [handleGoal, updateTrackedPaddle],
   );
+
+  const stopCameraStream = useCallback(() => {
+    const video = videoRef.current;
+    if (video?.srcObject) {
+      const stream = video.srcObject as MediaStream;
+      stream.getTracks().forEach((track) => track.stop());
+      video.srcObject = null;
+    }
+  }, []);
+
+  const initializeGame = useCallback(async () => {
+    try {
+      updateUiState("LOADING");
+      setErrorMessage("");
+      setPlayerCount(0);
+      lastVideoTimeRef.current = -1;
+      lastDetectionTimeRef.current = 0;
+      lastFrameTimeRef.current = null;
+      leftTrackingRef.current = {
+        smoothed: null,
+        previousRaw: null,
+        velocity: { x: 0, y: 0 },
+        lastSeenTime: 0,
+      };
+      rightTrackingRef.current = {
+        smoothed: null,
+        previousRaw: null,
+        velocity: { x: 0, y: 0 },
+        lastSeenTime: 0,
+      };
+      stopCameraStream();
+      if (handLandmarkerRef.current) {
+        handLandmarkerRef.current.close();
+        handLandmarkerRef.current = null;
+      }
+
+      setStatusText("Optimizing Engine (GPU Hand Tracking)...");
+      try {
+        handLandmarkerRef.current = await createHandLandmarker("GPU");
+      } catch (gpuError) {
+        console.warn("GPU hand tracking failed, retrying with CPU.", gpuError);
+        setStatusText("GPU unavailable. Starting CPU Hand Tracking...");
+        handLandmarkerRef.current = await createHandLandmarker("CPU");
+      }
+
+      setStatusText("Opening webcam...");
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 960 },
+          height: { ideal: 540 },
+          frameRate: { ideal: 60, min: 30 },
+          facingMode: "user",
+        },
+        audio: false,
+      });
+
+      const video = videoRef.current;
+      if (!video) {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error("Video element is not available.");
+      }
+
+      video.srcObject = stream;
+      video.onloadedmetadata = () => {
+        void video.play();
+        handleResize();
+        updateUiState("START");
+        setStatusText("System ready. Waiting for players.");
+        document.title = "GDG Air Hockey Game";
+      };
+    } catch (error: unknown) {
+      console.error("Setup Error:", error);
+      stopCameraStream();
+      if (handLandmarkerRef.current) {
+        handLandmarkerRef.current.close();
+        handLandmarkerRef.current = null;
+      }
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Camera permission or hand tracking setup failed.";
+      setErrorMessage(message);
+      setStatusText("Camera or hand tracking setup failed.");
+      updateUiState("ERROR");
+    }
+  }, [handleResize, stopCameraStream, updateUiState]);
 
   // INITIALIZATION
   useEffect(() => {
-    let isComponentMounted = true;
-    const initSetup = async () => {
-      try {
-        setStatusText("Optimizing Engine (GPU Hand Tracking)...");
-        const filesetResolver = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/wasm",
-        );
-
-        handLandmarkerRef.current = await HandLandmarker.createFromOptions(filesetResolver, {
-          baseOptions: {
-            modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-            delegate: "GPU",  // GPU delegate for lower latency detection
-          },
-          runningMode: "VIDEO",
-          numHands: 2,
-        });
-
-        if (!isComponentMounted) return;
-        setStatusText("Opening webcam...");
-
-        // Request high-quality 720p webcam feed
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            frameRate: { ideal: 60, min: 30 }, // Request high frame rate for smoother tracking
-            facingMode: "user",
-          },
-          audio: false,
-        });
-
-        const video = videoRef.current;
-        if (video) {
-          video.srcObject = stream;
-          video.onloadedmetadata = () => {
-            video.play();
-            handleResize();
-            updateUiState("START");
-            setStatusText("System ready. Waiting for players.");
-            document.title = "GDG Air Hockey Game";
-          };
-        }
-      } catch (error: unknown) {
-        console.error("Setup Error:", error);
-        setStatusText("Camera or permission error occurred.");
-      }
-    };
-    initSetup();
+    void initializeGame();
     window.addEventListener("resize", handleResize);
     return () => {
-      isComponentMounted = false;
       window.removeEventListener("resize", handleResize);
       if (requestRef.current) cancelAnimationFrame(requestRef.current);
       if (handLandmarkerRef.current) handLandmarkerRef.current.close();
-      if (videoRef.current?.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach((t) => t.stop());
-      }
+      stopCameraStream();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [handleResize, initializeGame, stopCameraStream]);
 
   useEffect(() => {
     requestRef.current = requestAnimationFrame(gameLoop);
@@ -594,7 +540,7 @@ export default function AirHockeyGame() {
 
       <div className="absolute inset-0 pointer-events-none z-10 flex flex-col">
 
-        {/* ── Header ── */}
+        {/* Header */}
         <header
           style={{
             height: `${HEADER_HEIGHT}px`,
@@ -691,7 +637,7 @@ export default function AirHockeyGame() {
           </div>
         </header>
 
-        {/* ── Smash flash overlay ── */}
+        {/* Smash flash overlay */}
         {smashFlash && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
             <div className="text-center animate-bounce">
@@ -701,13 +647,13 @@ export default function AirHockeyGame() {
                   textShadow: `0 0 60px ${GDG_YELLOW}, 0 0 100px ${GDG_RED}`,
                 }}
               >
-                ⚡ SMASH! ⚡
+                SMASH!
               </div>
             </div>
           </div>
         )}
 
-        {/* ── Overlays (loading / countdown / end) ── */}
+        {/* Overlays (loading / countdown / end) */}
         <div className="flex-grow flex flex-col justify-center items-center">
 
           {/* Loading screen */}
@@ -743,6 +689,46 @@ export default function AirHockeyGame() {
             </div>
           )}
 
+          {/* Error screen */}
+          {uiState === "ERROR" && (
+            <div
+              style={{
+                background: "rgba(255,255,255,0.95)", borderRadius: 20,
+                padding: "28px 36px", border: "2px solid rgba(255,255,255,0.95)",
+                boxShadow: "0 10px 40px rgba(0,0,0,0.18)", textAlign: "center",
+                backdropFilter: "blur(12px)", maxWidth: 460, width: "100%", margin: "0 16px",
+              }}
+              className="pointer-events-auto"
+            >
+              <div style={{ fontSize: 10, letterSpacing: "0.4em", color: GDG_RED, marginBottom: 12, fontWeight: 900 }}>
+                SETUP ERROR
+              </div>
+              <h1 style={{ fontSize: 34, fontWeight: 900, margin: "0 0 10px", color: "#373636" }}>
+                Camera Not Ready
+              </h1>
+              <p style={{ fontSize: 14, color: "#5F6368", lineHeight: 1.5, margin: "0 0 8px" }}>
+                Allow camera access and make sure the hand tracking model can load, then try again.
+              </p>
+              {errorMessage && (
+                <p style={{ fontSize: 12, color: GDG_RED, lineHeight: 1.4, margin: "0 0 18px" }}>
+                  {errorMessage}
+                </p>
+              )}
+              <button
+                onClick={() => void initializeGame()}
+                style={{
+                  width: "100%", padding: "12px 0", borderRadius: 12,
+                  fontWeight: 900, fontSize: 15, letterSpacing: "0.2em",
+                  textTransform: "uppercase", border: "none", cursor: "pointer",
+                  background: `linear-gradient(135deg, ${GDG_BLUE}, ${GDG_GREEN})`,
+                  color: "white", boxShadow: "0 4px 20px rgba(66,133,244,0.35)",
+                }}
+              >
+                RETRY CAMERA
+              </button>
+            </div>
+          )}
+
           {/* Start screen */}
           {uiState === "START" && (
             <div className="pointer-events-auto" style={{ maxWidth: 480, width: "100%", margin: "0 16px" }}>
@@ -764,7 +750,7 @@ export default function AirHockeyGame() {
 
                 <div style={{ textAlign: "center", marginBottom: 16 }}>
                   <div style={{ fontSize: 9, letterSpacing: "0.5em", color: GDG_GREEN, marginBottom: 6, fontWeight: 900 }}>
-                    ⚡ GDG SPECIAL EDITION ONLINE ⚡
+                    GDG SPECIAL EDITION ONLINE
                   </div>
                   <h1 style={{ fontSize: 44, fontWeight: 900, margin: 0, letterSpacing: -1 }}>
                     <GDGTitle text="GDG Air - Hockey" />
@@ -784,15 +770,15 @@ export default function AirHockeyGame() {
                   <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 6 }}>
                     <li style={{ color: "#373636" }}>Center yourself completely in front of the lens.</li>
                     <li style={{ display: "flex", gap: 8, alignItems: "center", color: "#373636" }}>
-                      <span style={{ color: GDG_GREEN, fontWeight: 900 }}>→</span>
+                      <span style={{ color: GDG_GREEN, fontWeight: 900 }}>-</span>
                       <span><span style={{ color: GDG_RED, fontWeight: 900 }}>Player A (Left Half)</span> Moves any hand on the left field.</span>
                     </li>
                     <li style={{ display: "flex", gap: 8, alignItems: "center", color: "#373636", whiteSpace: "nowrap" }}>
-                      <span style={{ color: GDG_GREEN, fontWeight: 900 }}>→</span>
+                      <span style={{ color: GDG_GREEN, fontWeight: 900 }}>-</span>
                       <span><span style={{ color: GDG_BLUE, fontWeight: 900 }}>Player B (Right Half)</span> Moves any hand on the right field.</span>
                     </li>
                     <li style={{ display: "flex", gap: 8, alignItems: "center", color: "#373636" }}>
-                      <span style={{ color: GDG_YELLOW, fontWeight: 900 }}>★</span>
+                      <span style={{ color: GDG_YELLOW, fontWeight: 900 }}>*</span>
                       <span>First to score <strong>3 goals</strong> wins the match.</span>
                     </li>
                   </ul>
@@ -808,7 +794,7 @@ export default function AirHockeyGame() {
                     color: "white", boxShadow: "0 4px 20px rgba(66,133,244,0.35)",
                   }}
                 >
-                  ⚔ START BATTLE ⚔
+                  START BATTLE
                 </button>
               </div>
             </div>
@@ -843,7 +829,7 @@ export default function AirHockeyGame() {
               }}
             >
               <div style={{ fontSize: 9, letterSpacing: "0.4em", color: GDG_YELLOW, marginBottom: 8, fontWeight: 900 }}>
-                ⚔ BATTLE COMPLETE ⚔
+                BATTLE COMPLETE
               </div>
               <h2 style={{ fontSize: 46, fontWeight: 900, margin: "0 0 4px", color: GDG_YELLOW }}>VICTORY!</h2>
               <p style={{ color: "#5F6368", fontSize: 12, letterSpacing: "0.3em", marginBottom: 4, fontWeight: 700 }}>
@@ -860,7 +846,7 @@ export default function AirHockeyGame() {
               </p>
               <div style={{ fontSize: 13, color: "#5F6368", marginBottom: 16 }}>
                 Final Score: <span style={{ color: GDG_RED, fontWeight: 900 }}>{scores.left}</span>
-                {" — "}
+                {" - "}
                 <span style={{ color: GDG_BLUE, fontWeight: 900 }}>{scores.right}</span>
               </div>
               <button
@@ -878,7 +864,7 @@ export default function AirHockeyGame() {
           )}
         </div>
 
-        {/* ── Footer ── */}
+        {/* Footer */}
         <footer
           style={{
             height: `${FOOTER_HEIGHT}px`,
